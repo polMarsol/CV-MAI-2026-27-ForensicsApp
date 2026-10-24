@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -12,6 +13,7 @@ from forensics_app.core import ImageDocument
 from forensics_app.tools.base import ForensicsTool
 from forensics_app.tools.registry import ToolRegistry
 from .image_view import ImageView
+from forensics_app.core.pixel_info import pixel_color, describe_pixel
 
 
 OPEN_TYPES = [
@@ -21,12 +23,21 @@ OPEN_TYPES = [
 SAVE_TYPES = [("PNG image", "*.png"), ("JPEG image", "*.jpg"), ("TIFF image", "*.tiff")]
 
 
+def _mousewheel_units(delta: int) -> int:
+    if sys.platform == "darwin" and tk.TkVersion < 8.7:
+        return -delta
+
+    units = int(-delta / 120)
+    return units if units else (-1 if delta > 0 else 1)
+
+
 class MainWindow:
     def __init__(self, root: tk.Tk, registry: ToolRegistry) -> None:
         self.root = root
         self.registry = registry
         self.document = ImageDocument()
         self.status = tk.StringVar(value="Ready. Open an image to begin.")
+        self.pixel_info = tk.StringVar(value="Hover over the image to inspect pixels.")
 
         self._configure_window()
         self._build_menu()
@@ -84,17 +95,67 @@ class MainWindow:
         body = ttk.Panedwindow(container, orient="horizontal")
         body.pack(fill="both", expand=True)
 
-        sidebar = ttk.Frame(body, style="Sidebar.TFrame", padding=12, width=235)
+        sidebar = ttk.Frame(body, style="Sidebar.TFrame", width=270)
         sidebar.pack_propagate(False)
         body.add(sidebar, weight=0)
-        ttk.Label(sidebar, text="Forensics tools", style="Title.TLabel", background="#eef1f5").pack(
-            anchor="w", pady=(0, 12)
+
+        title_label = ttk.Label(sidebar, text="Forensics tools", style="Title.TLabel", background="#eef1f5")
+        title_label.pack(anchor="w", padx=12, pady=(12, 8))
+
+        scroll_container = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        scroll_container.pack(fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(scroll_container, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+
+        canvas = tk.Canvas(
+            scroll_container,
+            background="#eef1f5",
+            highlightthickness=0,
+            borderwidth=0,
+            yscrollcommand=scrollbar.set,
         )
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=canvas.yview)
+
+        content = ttk.Frame(canvas, style="Sidebar.TFrame", padding=(12, 0, 4, 12))
+        canvas_window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        content.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfig(canvas_window, width=event.width),
+        )
+
+        def _on_mousewheel(event: tk.Event) -> None:
+            if event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+            elif event.delta:
+                canvas.yview_scroll(_mousewheel_units(event.delta), "units")
+
+        def _bind_scroll(widget: tk.Misc) -> None:
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Button-4>", _on_mousewheel, add="+")
+            widget.bind("<Button-5>", _on_mousewheel, add="+")
+
+        _bind_scroll(sidebar)
+        _bind_scroll(scroll_container)
+        _bind_scroll(canvas)
+        _bind_scroll(content)
+        _bind_scroll(title_label)
+
         for category, tools in self.registry.categories():
-            ttk.Label(sidebar, text=category, style="Category.TLabel").pack(anchor="w", pady=(9, 4))
+            cat_label = ttk.Label(content, text=category, style="Category.TLabel")
+            cat_label.pack(anchor="w", pady=(9, 4))
+            _bind_scroll(cat_label)
             for tool in tools:
                 button = ttk.Button(
-                    sidebar,
+                    content,
                     text=tool.title,
                     style="Tool.TButton",
                     command=lambda selected=tool: self.run_tool(selected),
@@ -102,8 +163,10 @@ class MainWindow:
                 button.pack(fill="x", pady=2)
                 button.bind("<Enter>", lambda _event, selected=tool: self.status.set(selected.description))
                 button.bind("<Leave>", lambda _event: self.status.set("Ready."))
+                _bind_scroll(button)
 
-        self.image_view = ImageView(body)
+
+        self.image_view = ImageView(body, on_hover=self._on_pixel_hover)
         body.add(self.image_view, weight=1)
 
         inspector = ttk.Frame(body, padding=12, width=250)
@@ -117,7 +180,17 @@ class MainWindow:
         self.results.column("value", width=120, stretch=True)
         self.results.pack(fill="both", expand=True)
 
-        ttk.Label(container, textvariable=self.status, anchor="w", padding=(10, 6), relief="sunken").pack(fill="x")
+        status_bar = ttk.Frame(container, relief="sunken")
+        status_bar.pack(fill="x")
+
+        self.pixel_swatch = tk.Label(status_bar, width=2)
+        self.pixel_swatch.pack(side="right", padx=(0, 10), pady=4)
+        self._swatch_idle = self.pixel_swatch.cget("background")
+
+        ttk.Label(status_bar, textvariable=self.pixel_info, font="TkFixedFont").pack(side="right", padx=6)
+        ttk.Label(status_bar, textvariable=self.status, anchor="w", padding=(10,6)).pack(
+            side="left", fill="x", expand=True
+        )
 
     def _bind_shortcuts(self) -> None:
         self.root.bind_all("<Control-o>", lambda _event: self.open_image())
@@ -170,11 +243,14 @@ class MainWindow:
         if result is None:
             self.status.set(f"Cancelled {tool.title}.")
             return
-        if result.image is not None:
+        if result.image is not None and not result.preview_only:
             self.document.apply(result.image)
         self._show_details(result.details)
         self.status.set(result.message)
         self._refresh()
+        # If the result is a preview image, show it in the image view without applying it to the document
+        if result.image is not None and result.preview_only:
+            self.image_view.show(result.image)
 
     def undo(self) -> None:
         if self.document.undo():
@@ -206,6 +282,18 @@ class MainWindow:
         self.redo_button.configure(state="normal" if self.document.can_redo else "disabled")
         title = self.document.path.name if self.document.path else "No image"
         self.root.title(f"ForensicsApp — {title}")
+
+    def _on_pixel_hover(self, coords: tuple[int, int] | None) -> None:
+        image = self.image_view.image
+        if coords is None or image is None:
+            self.pixel_info.set("Hover over the image to inspect pixels.")
+            self.pixel_swatch.configure(background=self._swatch_idle)
+            return
+
+        self.pixel_info.set(describe_pixel(image, *coords))
+        color = pixel_color(image, *coords)
+        swatch = "#{:02x}{:02x}{:02x}".format(*color) if color else self._swatch_idle
+        self.pixel_swatch.configure(background=swatch)    
 
     def _show_default_details(self) -> None:
         image = self.document.current
